@@ -1,13 +1,15 @@
+use crate::RespValue::BulkString;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use std::collections::HashMap;
+use std::ops::{Add, Sub};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
-use crate::RespValue::BulkString;
-
-type Storage = Arc<RwLock<HashMap<String, String>>>;
+type Storage = Arc<RwLock<HashMap<String, (String, Option<Duration>)>>>;
+// Para la expiración, guardar en el hashmap un tuple de string y u64 que sea el tiempo en ms
 
 #[derive(Debug, PartialEq, Clone)]
 enum RespValue {
@@ -230,25 +232,70 @@ async fn handle_echo(args: &[RespValue]) -> RespValue {
 }
 
 async fn handle_set(args: &[RespValue], db: &Storage) -> RespValue {
-    if args.len() != 2 {
-        return RespValue::Error("ERR Wrong number of arguments for command SET".to_string());
+    // 1. Validar número de argumentos (2 sin expiración, 4 con EX/PX)
+    if ![2, 4].contains(&args.len()) {
+        return RespValue::Error("ERR wrong number of arguments for 'set' command".to_string());
     }
 
+    // 2. Extraer clave y valor
     let (RespValue::BulkString(Some(key)), RespValue::BulkString(Some(val))) = (&args[0], &args[1])
     else {
-        return RespValue::Error("ERR key and value mus be BulkString".to_string());
+        return RespValue::Error("ERR key and value must be BulkString".to_string());
     };
 
     let key = String::from_utf8_lossy(key).to_string();
     let val = String::from_utf8_lossy(val).to_string();
 
-    let mut map = match db.write() {
-        Ok(guard) => guard,
-        Err(err) => return RespValue::Error(err.to_string()),
+    // 3. Procesar la expiración si se pasaron 4 argumentos
+    let expiration_date = if args.len() == 4 {
+        let RespValue::BulkString(Some(exp_type_bytes)) = &args[2] else {
+            return RespValue::Error("ERR syntax error".to_string());
+        };
+        let exp_type = String::from_utf8_lossy(exp_type_bytes).to_lowercase();
+
+        let exp_num: i64 = match &args[3] {
+            RespValue::Integers(n) => *n,
+            RespValue::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return RespValue::Error(
+                            "ERR value is not an integer or out of range".to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {
+                return RespValue::Error("ERR value is not an integer or out of range".to_string());
+            }
+        };
+
+        // Redis no permite tiempos de expiración menores o iguales a 0
+        if exp_num <= 0 {
+            return RespValue::Error("ERR invalid expire time in 'set' command".to_string());
+        }
+
+        let exp_duration = match exp_type.as_str() {
+            "px" => Duration::from_millis(exp_num as u64),
+            "ex" => Duration::from_secs(exp_num as u64),
+            _ => return RespValue::Error("ERR syntax error".to_string()),
+        };
+
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return RespValue::Error("ERR system clock error".to_string());
+        };
+
+        Some(now + exp_duration)
+    } else {
+        None
     };
 
-    map.insert(key, val);
+    let mut map = match db.write() {
+        Ok(guard) => guard,
+        Err(err) => return RespValue::Error(format!("ERR {}", err)),
+    };
 
+    map.insert(key, (val, expiration_date));
     RespValue::SimpleString("OK".to_string())
 }
 
@@ -268,10 +315,20 @@ async fn handle_get(args: &[RespValue], db: &Storage) -> RespValue {
 
     let key = String::from_utf8_lossy(key).to_string();
 
-    let Some(val) = map.get(&key) else {
+    let Some((val, time)) = map.get(&key) else {
         return RespValue::Error("ERR Key doesn't exist".to_string());
     };
 
+    if let Some(dur) = time {
+        println!("Expiration time: {:?}", dur);
+        let Ok(start) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return RespValue::Error("ERR error al conseguir el tiempo actual".to_string());
+        };
+        if *dur < start {
+            println!("Expired");
+            return RespValue::BulkString(None);
+        }
+    }
     RespValue::BulkString(Some(val.to_string().into_bytes()))
 }
 #[tokio::main]
