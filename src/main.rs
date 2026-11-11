@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 fn main() {
     let listener =
@@ -8,7 +8,17 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut _stream) => {
-                _stream.write_all(b"+PONG\r\n").expect("Error de conexión");
+                let mut buf = [0; 512];
+
+                loop {
+                    let bytes_read = _stream.read(&mut buf).expect("Error al leer el input");
+                    if bytes_read == 0 {
+                        println!("El comando no puede estar vacío");
+                        break;
+                    }
+
+                    _stream.write_all(b"+PONG\r\n").expect("Error de conexión");
+                }
             }
             Err(e) => {
                 println!("error: {}", e);
