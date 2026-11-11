@@ -1,9 +1,13 @@
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 use crate::RespValue::BulkString;
+
+type Storage = Arc<RwLock<HashMap<String, String>>>;
 
 #[derive(Debug, PartialEq, Clone)]
 enum RespValue {
@@ -156,15 +160,15 @@ fn parse_array(buf: &[u8]) -> Result<Option<(RespValue, usize)>, String> {
     Ok(Some((RespValue::Array(Some(elements)), offset)))
 }
 
-async fn execute_command(command: RespValue) -> RespValue {
+async fn execute_command(command: RespValue, db: &Storage) -> RespValue {
     match command {
-        RespValue::Array(Some(elements)) => parse_array_command(elements).await,
+        RespValue::Array(Some(elements)) => parse_array_command(elements, db).await,
         RespValue::Array(None) => RespValue::Error("ERR array nulo recibido".to_string()),
         _ => RespValue::Error("ERR se esperaba un Array RESP".to_string()),
     }
 }
 
-async fn parse_array_command(elements: Vec<RespValue>) -> RespValue {
+async fn parse_array_command(elements: Vec<RespValue>, db: &Storage) -> RespValue {
     // 1. Separamos el primer elemento (el comando) del resto (los argumentos)
     let Some((first, args)) = elements.split_first() else {
         return RespValue::Error("ERR comando vacío".to_string());
@@ -184,8 +188,8 @@ async fn parse_array_command(elements: Vec<RespValue>) -> RespValue {
     match cmd_bytes.to_ascii_uppercase().as_slice() {
         b"PING" => handle_ping(args).await,
         b"ECHO" => handle_echo(args).await,
-        // b"SET"  => handle_set(args),
-        // b"GET"  => handle_get(args),
+        b"SET" => handle_set(args, db).await,
+        b"GET" => handle_get(args, db).await,
         other => {
             let cmd_name = String::from_utf8_lossy(other);
             RespValue::Error(format!("ERR comando desconocido '{}'", cmd_name))
@@ -225,20 +229,68 @@ async fn handle_echo(args: &[RespValue]) -> RespValue {
     };
 }
 
+async fn handle_set(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 2 {
+        return RespValue::Error("ERR Wrong number of arguments for command SET".to_string());
+    }
+
+    let (RespValue::BulkString(Some(key)), RespValue::BulkString(Some(val))) = (&args[0], &args[1])
+    else {
+        return RespValue::Error("ERR key and value mus be BulkString".to_string());
+    };
+
+    let key = String::from_utf8_lossy(key).to_string();
+    let val = String::from_utf8_lossy(val).to_string();
+
+    let mut map = match db.write() {
+        Ok(guard) => guard,
+        Err(err) => return RespValue::Error(err.to_string()),
+    };
+
+    map.insert(key, val);
+
+    RespValue::SimpleString("OK".to_string())
+}
+
+async fn handle_get(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 1 {
+        return RespValue::Error("Wrong number of arguments for command GET".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("Wrong number of arguments for command GET".to_string());
+    };
+
+    let map = match db.write() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(e.to_string()),
+    };
+
+    let key = String::from_utf8_lossy(key).to_string();
+
+    let Some(val) = map.get(&key) else {
+        return RespValue::Error("ERR Key doesn't exist".to_string());
+    };
+
+    RespValue::BulkString(Some(val.to_string().into_bytes()))
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     // Creamos un Tcp listener de tokio para poder enlazar puertos de forma asíncrona
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     println!("Servidor escuchando en 127.0.0.1:6379");
 
+    let db: Storage = Arc::new(RwLock::new(HashMap::new()));
+
     loop {
         // Listener.accept() devuelve el stream y la localización de quien esta conectado
         let (socket, peer_addr) = listener.accept().await?;
         println!("Nueva conexión desde {peer_addr}");
+        let client_db = Arc::clone(&db);
         // Creamos una green thread para cada cliente
         tokio::spawn(async move {
             // separamos responsabilidades de la conexion a manejar como va el cliente
-            if let Err(e) = handle_client(socket).await {
+            if let Err(e) = handle_client(socket, client_db).await {
                 eprintln!("Error con el cliente {peer_addr}: {e}");
             }
             println!("Conexión cerrada: {peer_addr}");
@@ -246,9 +298,9 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_client(mut socket: TcpStream) -> Result<()> {
-    // Creamos un buffer de 512 bytes donde se almacenarán los comandos
-    let mut buf = BytesMut::with_capacity(512);
+async fn handle_client(mut socket: TcpStream, db: Storage) -> Result<()> {
+    // Creamos un buffer de 4096 bytes donde se almacenarán los comandos
+    let mut buf = BytesMut::with_capacity(4096);
     // Loopeamos para poder recibir mas de 1 comando por thread
     loop {
         // Leemos los bits del buffer
@@ -268,12 +320,7 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
                     println!("Comando recibido: {:?}", command);
 
                     // Escribimos la respuesta
-                    let response = execute_command(command).await;
-                    println!("Respuesta cruda: {:?}", response);
-                    println!(
-                        "Respuesta serializada: {:?}",
-                        String::from_utf8(response.serialize())
-                    );
+                    let response = execute_command(command, &db).await;
                     socket.write_all(&response.serialize()).await?
                 }
                 Ok(None) => break,
