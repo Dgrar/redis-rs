@@ -20,7 +20,7 @@ impl RespValue {
                 response.extend_from_slice(b"\r\n");
                 response
             }
-            Self::Array(None) => b"*-1\r\n".to_vec(),
+            Self::Array(None) => b"*0\r\n".to_vec(),
             Self::Array(Some(data)) => {
                 let mut response = format!("*{}\r\n", data.len()).into_bytes();
                 for element in data {

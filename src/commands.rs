@@ -1,5 +1,6 @@
 use crate::resp::RespValue;
 use crate::storage::{Entry, Storage};
+use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 
 pub fn execute_command(command: RespValue, db: &Storage) -> RespValue {
@@ -25,6 +26,7 @@ fn dispatch(elements: Vec<RespValue>, db: &Storage) -> RespValue {
         b"SET" => handle_set(args, db),
         b"GET" => handle_get(args, db),
         b"RPUSH" => handle_rpush(args, db),
+        b"LRANGE" => handle_lrange(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -172,7 +174,7 @@ pub fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
             return RespValue::Error("ERR key and value must be BulkString".to_string());
         };
 
-        let len = (val.len() as u32).to_be_bytes();
+        let len: [u8; 4] = (val.len() as u32).to_be_bytes();
         entry.value.extend_from_slice(&len);
         entry.value.extend_from_slice(val);
     }
@@ -192,6 +194,77 @@ pub fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
     }
 
     RespValue::Integers(count)
+}
+
+pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 3 {
+        return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
+    };
+
+    let (RespValue::BulkString(Some(start)), RespValue::BulkString(Some(end))) =
+        (&args[1], &args[2])
+    else {
+        return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
+    };
+
+    let map = match db.read() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+    let mut count = 0;
+    let mut cursor = 1;
+
+    let Some(entry) = map.get(key) else {
+        return RespValue::Array(None);
+    };
+
+    let Ok(end_num) = String::from_utf8_lossy(end).parse::<isize>() else {
+        return RespValue::Error("ERR the end value is not an integer".to_string());
+    };
+
+    let end_num = if end_num == -1 {
+        usize::MAX
+    } else if end_num < 0 {
+        return RespValue::Error("ERR the end value must be greater than -2)".to_string());
+    } else {
+        end_num as usize
+    };
+
+    let Ok(start_num) = String::from_utf8_lossy(start).parse::<usize>() else {
+        return RespValue::Error("ERR the end value is not an integer".to_string());
+    };
+
+    if start_num > end_num {
+        return RespValue::Array(None);
+    }
+
+    let mut elements: Vec<&[u8]> = Vec::new();
+
+    while cursor + 4 <= entry.value.len() && count <= end_num {
+        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
+            Ok(len) => len,
+            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        };
+        let elem_len = u32::from_be_bytes(len_bytes) as usize;
+        if count >= start_num {
+            elements.push(match entry.value.get(cursor + 4..cursor + 4 + elem_len) {
+                Some(b) => b,
+                None => break,
+            });
+        }
+        cursor += 4 + elem_len;
+        count += 1
+    }
+    let values = elements
+        .into_iter()
+        .map(|el| RespValue::BulkString(Some(el.to_vec())))
+        .collect();
+
+    RespValue::Array(Some(values))
 }
 
 #[cfg(test)]
