@@ -1,6 +1,5 @@
 use crate::resp::RespValue;
 use crate::storage::{Entry, Storage};
-use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 
 pub fn execute_command(command: RespValue, db: &Storage) -> RespValue {
@@ -28,6 +27,7 @@ fn dispatch(elements: Vec<RespValue>, db: &Storage) -> RespValue {
         b"RPUSH" => handle_rpush(args, db),
         b"LPUSH" => handle_lpush(args, db),
         b"LRANGE" => handle_lrange(args, db),
+        b"LLEN" => handle_llen(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -346,6 +346,39 @@ fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
         .collect();
     println!("Values: {:?}", values);
     RespValue::Array(Some(values))
+}
+fn handle_llen(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 1 {
+        return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
+    };
+
+    let map = match db.read() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    let Some(entry) = map.get(key) else {
+        return RespValue::Integers(0);
+    };
+
+    let mut count = 0;
+    let mut cursor = 1;
+
+    while cursor + 4 <= entry.value.len() {
+        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
+            Ok(val) => val,
+            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        };
+        let elem_len = u32::from_be_bytes(len_bytes) as usize;
+        cursor += 4 + elem_len;
+        count += 1;
+    }
+
+    RespValue::Integers(count)
 }
 
 #[cfg(test)]
