@@ -1,95 +1,100 @@
 # codecrafters-redis
 
-Servidor TCP que implementa un subconjunto de Redis sobre RESP2: `PING`, `ECHO`, `SET` (con expiración `PX`/`EX`) y `GET`. El objetivo es entender parsing binario, I/O asíncrono y estado compartido sin reutilizar la implementación de referencia.
-
-Reto «Build your own Redis» de CodeCrafters, evidenciado por `codecrafters.yml` y los scripts de `.codecrafters/`.
+Servidor TCP que implementa un subconjunto de Redis sobre RESP2: strings con expiración, listas y `BLPOP` bloqueante sobre Tokio. Reto «Build your own Redis» de CodeCrafters.
 
 ## Estado y funcionalidades actuales
 
-Prototipo funcional en desarrollo. Compila con Rust edición 2024 y los 21 tests unitarios pasan con `cargo test`.
+Prototipo WIP. Compila con Rust edición 2024 y pasa los 14 tests unitarios existentes (`cargo test`): parser RESP2 y serialización. Los handlers de comandos no tienen tests.
 
-- **`PING`**: responde `+PONG`; los argumentos adicionales se ignoran.
-- **`ECHO`**: devuelve el argumento recibido y exige exactamente uno.
-- **`SET`**: `SET key value [PX ms | EX s]`; guarda el par y responde `+OK`. Rechaza tiempos de expiración menores o iguales a cero y opciones distintas de `PX`/`EX`.
-- **`GET`**: devuelve el valor como `BulkString` o `$-1` si la clave no existe o ya expiró.
-- **Parser RESP2**: acepta strings simples, errores, enteros, bulk strings (incluidos nulos y binarios) y arrays anidados (`src/parser.rs`).
-- **Pipelining**: procesa todos los mensajes completos acumulados en el buffer antes de volver a leer del socket (`src/main.rs:52-67`).
-- **Concurrencia**: una tarea de Tokio por conexión y un `HashMap` global protegido por `RwLock` (`src/main.rs:21-35`).
-- **Verificación**: tests unitarios de parsing, serialización, comandos y expiración en los módulos de `src/`.
+- **`PING` / `ECHO`**: `+PONG` y eco exacto de un argumento.
+- **`SET` / `GET`**: `SET key value [PX ms | EX s]` con validación de expiración; `GET` devuelve bulk string o `$-1` si la clave no existe o expiró (expiración perezosa).
+- **`RPUSH` / `LPUSH`**: crean o modifican una lista y devuelven su longitud; `LPUSH` respeta el orden de Redis (el último argumento queda primero en la cabeza).
+- **`LRANGE` / `LLEN`**: rango inclusivo con índices negativos (`0 -1` = lista completa); `LLEN` devuelve `0` si la clave no existe.
+- **`LPOP`**: `LPOP key [count]`; devuelve bulk string o array, y elimina la clave cuando la lista queda vacía.
+- **`BLPOP`**: `BLPOP key [key...] timeout`; prueba las claves en orden, espera con `tokio::sync::Notify` sin bloquear el runtime, acepta timeout decimal en segundos (`0` = infinito) y devuelve array nulo (`*-1`) al vencer.
+- **Parser RESP2 incremental** y **pipelining**: varios mensajes por lectura y mensajes partidos entre paquetes TCP.
+- **Concurrencia**: una tarea Tokio por conexión, `HashMap` global bajo `RwLock` y un `Notify` global para despertar a los `BLPOP`.
 
 Limitaciones conocidas:
-- Solo existen cuatro comandos; no hay `DEL`, `EXISTS`, `INFO`, replicación, persistencia, Pub/Sub ni transacciones.
-- La expiración es perezosa: las claves vencidas se filtran en `GET` pero no se eliminan del `HashMap` hasta que se sobrescriben.
-- La dirección y el puerto están fijos en `127.0.0.1:6379`; no se leen flags de CLI ni variables de entorno.
+- Solo parser y serialización tienen tests; `SET`, `GET`, listas y `BLPOP` no tienen cobertura automatizada.
+- `GET`, `LRANGE` y `LLEN` no comprueban el tipo: `GET` de una lista devuelve su codificación interna (`0x02...`) y `LRANGE`/`LLEN` de un string interpretan bytes arbitrarios como lista. `SET` sobrescribe listas sin `WRONGTYPE`.
+- Expiración perezosa solo en `GET` y sin barrido; no hay `DEL`/`EXISTS`, replicación ni persistencia; la dirección está fija en `127.0.0.1:6379`; quedan `println!` de depuración en `LPUSH` y `LRANGE`.
 
 ## Requisitos y ejecución rápida
 
-- Rust 1.85+ (edición 2024). El repositorio fija `rust-1.96` en `codecrafters.yml`; verificado con `rustc 1.98.1` en Windows.
-- No requiere servicios externos. El servidor escucha en `127.0.0.1:6379`.
-- Cliente RESP opcional para el ejemplo: `redis-cli` (paquete `redis-tools`).
+- Rust 1.85+ (edición 2024). `codecrafters.yml` fija `rust-1.96`; verificado con `rustc 1.98.1` en Windows.
+- Sin servicios externos: el servidor escucha en `127.0.0.1:6379` (fijo; no lee flags ni variables de entorno).
+- Cliente RESP opcional para pruebas manuales (`redis-cli` u otro).
 
 ```bash
 # compilar
 cargo build --release
 
-# ejecutar los 21 tests unitarios
+# tests unitarios
 cargo test
 
-# arrancar el servidor (bloquea la terminal)
+# arrancar (bloquea la terminal)
 cargo run --release
 ```
 
-En entornos Unix, `./your_program.sh` reproduce la compilación a `/tmp` y el arranque que usa CodeCrafters.
+En Unix, `./your_program.sh` compila a `/tmp/codecrafters-build-redis-rust` y arranca el binario.
 
 ## Ejemplo de uso real
 
-Con el servidor en marcha, desde otra terminal (cualquier cliente RESP sirve; aquí se usa `redis-cli`):
+Con el servidor en marcha en otra terminal:
 
 ```bash
 redis-cli -p 6379 PING
-redis-cli -p 6379 SET clave valor
-redis-cli -p 6379 GET clave
-redis-cli -p 6379 SET temporal valor PX 100
-sleep 0.2
+redis-cli -p 6379 RPUSH lista a b c
+redis-cli -p 6379 LRANGE lista 0 -1
+redis-cli -p 6379 BLPOP lista 0
+redis-cli -p 6379 BLPOP vacia 0.1
+redis-cli -p 6379 SET temporal hola PX 50
+sleep 0.1
 redis-cli -p 6379 GET temporal
 ```
 
-Salida esperada, derivada de `src/commands.rs` y de los tests unitarios (no capturada de una sesión interactiva):
+Salida esperada (derivada de `src/commands.rs` y `src/resp.rs`; la secuencia RESP se contrastó con una ejecución real por socket, sin `redis-cli` en el entorno):
 
 ```text
 PONG
-OK
-"valor"
+(integer) 3
+1) "a"
+2) "b"
+3) "c"
+1) "lista"
+2) "a"
+(nil)
 OK
 (nil)
 ```
 
-El servidor imprime en stdout cada conexión aceptada y cerrada (`src/main.rs:26` y `src/main.rs:34`).
+`BLPOP vacia 0.1` vence a los 100 ms y responde array nulo; `GET temporal` ya no encuentra la clave por el `PX 50`.
 
 ## Decisiones de arquitectura y aprendizaje
 
-- **Concurrencia**: el bucle principal hace `accept().await` y lanza `tokio::spawn` por cliente (`src/main.rs:23-35`). Cada conexión tiene su propio `BytesMut`, así que el estado mutable solo se comparte a través del almacén. El coste es que no hay límite de conexiones, backpressure ni apagado ordenado.
-- **Estado compartido**: `Storage` es `Arc<RwLock<HashMap<Vec<u8>, Entry>>>` (`src/storage.rs:5`). `SET` toma el lock de escritura y `GET` el de lectura, lo que permite lecturas concurrentes; a cambio, un lock global serializa las escrituras y bloquea todas las lecturas mientras dura una escritura.
-- **Claves y valores binarios**: se usan `Vec<u8>` en lugar de `String` (`src/storage.rs:5-10`), de modo que el servidor no impone UTF-8 ni pierde bytes. El parser conserva los `\r\n` internos de un bulk string, cubierto por el test `parse_bulk_string`. El compromiso es que la API interna no ofrece garantías de texto y cada respuesta clona el valor (`src/commands.rs:140`).
-- **Parsing incremental**: `parse_message` recibe un `&[u8]` y devuelve `(RespValue, bytes_consumidos)` o `None` si el mensaje está incompleto (`src/parser.rs:3`). `main` avanza el buffer con `Buf::advance` y repite el parseo, lo que habilita pipelining y mensajes partidos entre paquetes TCP. El coste es que cada lectura vuelve a escanear desde el inicio del buffer y copia el cuerpo de los bulk strings; no hay zero-copy.
-- **Errores de protocolo**: el parser usa `Result<_, String>` y un fallo de sintaxis se serializa como error RESP y cierra la conexión (`src/main.rs:61-65`). Los errores de comando, en cambio, viajan como `RespValue::Error` sin cortar la conexión. No hay un enum de errores tipado; `anyhow` se usa solo para los fallos de I/O en `main`.
-- **Expiración perezosa**: `Entry` guarda `Option<SystemTime>` y `is_expired` compara con el reloj en cada `GET` (`src/storage.rs:18-21`). Evita un hilo o temporizador de limpieza, pero deja memoria ocupada por claves vencidas y hace que el coste de comprobación recaiga en cada lectura.
+- **Listas en un único `Vec<u8>`** (`src/commands.rs:161`, `src/commands.rs:177`): el `Entry.value` de una lista es `[0x02][longitud u32 BE][bytes]...`. Evita una asignación por elemento y reutiliza el mismo `Entry` que los strings; el precio es O(n): `LPUSH` reconstruye el buffer y `LPOP`/`BLPOP` desplazan el resto con `copy_within`.
+- **Estado compartido** (`src/storage.rs:5`, `src/main.rs:22`): `Arc<RwLock<HashMap<Vec<u8>, Entry>>>` global. `GET`, `LRANGE` y `LLEN` toman el lock de lectura (concurrentes) y las mutaciones el de escritura; un lock global serializa escrituras y bloquea lecturas mientras dura una escritura.
+- **BLPOP sin bloquear el runtime** (`src/commands.rs:363`): patrón comprobar → crear `notified()` + `enable()` → recomprobar → `timeout`/`await`. Registrar el waiter antes de la segunda comprobación evita el *lost wakeup*; ningún `RwLock` cruza un `await`. `pop_left` (`src/commands.rs:419`) clona el elemento para soltar el lock antes de esperar. Compromiso: `notify_waiters()` despierta a todos los clientes y no hay FIFO estricto.
+- **Dispatch async selectivo** (`src/commands.rs:10`, `src/main.rs:60`): `execute_command` es `async` para permitir la espera de `BLPOP`; mientras una conexión espera, el runtime sigue atendiendo al resto. La conexión bloqueada deja de leer, igual que Redis.
+- **Errores y parsing** (`src/parser.rs:3`, `src/main.rs:56`): parser incremental que devuelve `Option<(RespValue, usize)>`. Un error de protocolo responde error RESP y cierra la conexión; un error de comando viaja como `RespValue::Error` sin cerrarla. No hay enum de errores tipado: el parser usa `Result<_, String>` y `anyhow` queda para I/O en `main`.
+- **Nulo frente a vacío en RESP2** (`src/resp.rs:16`): `BulkString(None)` → `$-1`, `Array(None)` → `*-1`, `Array(Some(vec![]))` → `*0`. La distinción es deliberada: el timeout de `BLPOP` y `LPOP key count` sobre clave ausente son nulos, mientras `LRANGE` de una clave inexistente es un array vacío.
 
 ## Estructura del proyecto
 
 ```text
-Cargo.toml        # manifiesto del crate: edición 2024, tokio, bytes, anyhow
+Cargo.toml        # manifiesto: edición 2024; tokio, bytes, anyhow
 src/
-├── main.rs       # listener TCP, tarea por conexión, bucle lectura-parseo-respuesta
-├── commands.rs   # dispatch de PING, ECHO, SET y GET; validación y expiración
+├── main.rs       # listener TCP, tarea por conexión, bucle lectura-parseo-respuesta, Notify global
+├── commands.rs   # dispatch async: strings, listas, BLPOP y codificación interna de listas
 ├── parser.rs     # parser incremental de mensajes RESP2
-├── resp.rs       # enum RespValue y serialización a RESP2
+├── resp.rs       # enum RespValue y serialización RESP2
 └── storage.rs    # alias Storage, Entry y comprobación de expiración
 ```
 
 ## Próximos pasos
 
-- [ ] Añadir `DEL`, `EXISTS` e `INCR`, ausentes del dispatch de `src/commands.rs`.
-- [ ] Implementar expiración activa (barrido periódico) para liberar claves vencidas.
-- [ ] Hacer configurable la dirección y el puerto, hoy fijos en `src/main.rs:18`.
-- [ ] Añadir tests de integración sobre TCP: varios clientes, pipelining y cierres abruptos.
+- [ ] Restaurar tests de los handlers (`SET`, `GET`, listas y `BLPOP`); hoy solo hay 14 tests de parser y serialización.
+- [ ] Validar tipo de clave en `GET`, `LRANGE`, `LLEN` y `SET` (`WRONGTYPE`), como ya hacen `RPUSH`/`LPUSH`/`LPOP`.
+- [ ] Sustituir la expiración perezosa por un barrido periódico o purga en escritura.
+- [ ] Añadir tests de integración TCP con varios clientes y varios `BLPOP` esperando la misma clave.
