@@ -243,7 +243,7 @@ fn handle_lpush(args: &[RespValue], db: &Storage) -> RespValue {
         new_vec.extend_from_slice(&len);
         new_vec.extend_from_slice(value);
     }
-    new_vec.extend_from_slice(&entry.value);
+    new_vec.extend_from_slice(&entry.value[1..]);
     entry.value = new_vec;
 
     let mut count = 0;
