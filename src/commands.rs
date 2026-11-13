@@ -26,6 +26,7 @@ fn dispatch(elements: Vec<RespValue>, db: &Storage) -> RespValue {
         b"SET" => handle_set(args, db),
         b"GET" => handle_get(args, db),
         b"RPUSH" => handle_rpush(args, db),
+        b"LPUSH" => handle_lpush(args, db),
         b"LRANGE" => handle_lrange(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
@@ -144,7 +145,7 @@ fn handle_get(args: &[RespValue], db: &Storage) -> RespValue {
 
 const LIST_TYPE: u8 = 0x02;
 
-pub fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
+fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
     if args.len() <= 1 {
         return RespValue::Error("ERR wrong number of arguments for 'rpush' command".to_string());
     }
@@ -196,7 +197,73 @@ pub fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
     RespValue::Integers(count)
 }
 
-pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
+fn handle_lpush(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() <= 1 {
+        return RespValue::Error("ERR wrong number of arguments for 'lpush' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'lpush' command".to_string());
+    };
+
+    let mut map = match db.write() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    println!("Entry");
+
+    let entry = map.entry(key.to_vec()).or_insert_with(|| Entry {
+        value: vec![LIST_TYPE],
+        expires_at: None,
+    });
+
+    if entry.value.first() != Some(&LIST_TYPE) {
+        return RespValue::Error(
+            "ERR Operation against a key holding the wrong kind of value".to_string(),
+        );
+    }
+
+    let mut parsed_vals = Vec::with_capacity(args.len() - 1);
+    let mut extra_bytes = 0;
+    for argument in &args[1..] {
+        let RespValue::BulkString(Some(val)) = argument else {
+            return RespValue::Error("ERR key and value must be BulkString".to_string());
+        };
+        extra_bytes += 4 + val.len();
+        parsed_vals.push(val);
+    }
+
+    let mut new_vec = Vec::with_capacity(entry.value.len() + extra_bytes);
+
+    new_vec.push(LIST_TYPE);
+
+    for value in parsed_vals.into_iter().rev() {
+        let len = (value.len() as i32).to_be_bytes();
+        new_vec.extend_from_slice(&len);
+        new_vec.extend_from_slice(value);
+    }
+    new_vec.extend_from_slice(&entry.value);
+    entry.value = new_vec;
+
+    let mut count = 0;
+    let mut cursor = 1;
+
+    while cursor + 4 <= entry.value.len() {
+        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
+            Ok(len) => len,
+            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        };
+        let elem_len = u32::from_be_bytes(len_bytes) as usize;
+
+        cursor += 4 + elem_len;
+        count += 1
+    }
+
+    RespValue::Integers(count)
+}
+
+fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     if args.len() != 3 {
         return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
     }
@@ -240,8 +307,6 @@ pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
         count += 1;
     }
 
-    println!("Count: {count}");
-    println!("End num: {end_num}");
     let end_num = if end_num <= -1 {
         count + end_num
     } else {
@@ -252,7 +317,6 @@ pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     } else {
         start_num
     };
-    println!("New end num: {end_num}");
 
     if start_num > end_num {
         return RespValue::Array(None);
