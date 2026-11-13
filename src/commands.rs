@@ -28,6 +28,7 @@ fn dispatch(elements: Vec<RespValue>, db: &Storage) -> RespValue {
         b"LPUSH" => handle_lpush(args, db),
         b"LRANGE" => handle_lrange(args, db),
         b"LLEN" => handle_llen(args, db),
+        b"LPOP" => handle_lpop(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -261,6 +262,88 @@ fn handle_lpush(args: &[RespValue], db: &Storage) -> RespValue {
     }
 
     RespValue::Integers(count)
+}
+
+fn handle_lpop(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.is_empty() || args.len() > 2 {
+        return RespValue::Error("ERR wrong number of arguments for 'lpop' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'lpop' command".to_string());
+    };
+
+    let has_count_arg = args.len() == 2;
+    let count_target: usize = if has_count_arg {
+        let RespValue::BulkString(Some(val)) = &args[1] else {
+            return RespValue::Error("ERR value is not an integer or out of range".to_string());
+        };
+        let Ok(num) = String::from_utf8_lossy(val).parse::<usize>() else {
+            return RespValue::Error("ERR value is not an integer or out of range".to_string());
+        };
+        num
+    } else {
+        1
+    };
+
+    let mut map = match db.write() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    let Some(entry) = map.get_mut(key) else {
+        return if has_count_arg {
+            RespValue::Array(None)
+        } else {
+            RespValue::BulkString(None)
+        };
+    };
+
+    if entry.value.first() != Some(&LIST_TYPE) {
+        return RespValue::Error(
+            "ERR Operation against a key holding the wrong kind of value".to_string(),
+        );
+    }
+
+    if has_count_arg && count_target == 0 {
+        return RespValue::Array(Some(vec![]));
+    }
+
+    let mut popped_count = 0;
+    let mut cursor = 1;
+    let mut items_popped: Vec<Vec<u8>> = Vec::new();
+
+    while popped_count < count_target && cursor + 4 <= entry.value.len() {
+        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
+            Ok(len) => len,
+            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        };
+        let elem_len = u32::from_be_bytes(len_bytes) as usize;
+
+        let Some(data_slice) = entry.value.get(cursor + 4..cursor + 4 + elem_len) else {
+            break;
+        };
+        items_popped.push(data_slice.to_vec());
+        cursor += 4 + elem_len;
+        popped_count += 1;
+    }
+
+    if cursor >= entry.value.len() {
+        map.remove(key);
+    } else {
+        entry.value.copy_within(cursor.., 1);
+        entry.value.truncate(1 + (entry.value.len() - cursor));
+    }
+
+    if !has_count_arg {
+        RespValue::BulkString(items_popped.into_iter().next())
+    } else {
+        let values = items_popped
+            .into_iter()
+            .map(|el| RespValue::BulkString(Some(el)))
+            .collect();
+        RespValue::Array(Some(values))
+    }
 }
 
 fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
