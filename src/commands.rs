@@ -180,8 +180,6 @@ pub fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
     let mut count = 0;
     let mut cursor = 1;
 
-    println!("{:?}", entry.value);
-
     while cursor + 4 <= entry.value.len() {
         let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
             Ok(len) => len,
