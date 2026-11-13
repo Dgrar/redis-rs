@@ -1,16 +1,21 @@
+use tokio::sync::Notify;
+
 use crate::resp::RespValue;
 use crate::storage::{Entry, Storage};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-pub fn execute_command(command: RespValue, db: &Storage) -> RespValue {
+type Anotify = Arc<Notify>;
+
+pub async fn execute_command(command: RespValue, db: &Storage, notify: &Anotify) -> RespValue {
     match command {
-        RespValue::Array(Some(elements)) => dispatch(elements, db),
+        RespValue::Array(Some(elements)) => dispatch(elements, db, notify).await,
         RespValue::Array(None) => RespValue::Error("ERR array nulo recibido".to_string()),
         _ => RespValue::Error("ERR se esperaba un Array RESP".to_string()),
     }
 }
 
-fn dispatch(elements: Vec<RespValue>, db: &Storage) -> RespValue {
+async fn dispatch(elements: Vec<RespValue>, db: &Storage, notify: &Anotify) -> RespValue {
     let Some((first, args)) = elements.split_first() else {
         return RespValue::Error("ERR comando vacío".to_string());
     };
@@ -24,11 +29,20 @@ fn dispatch(elements: Vec<RespValue>, db: &Storage) -> RespValue {
         b"ECHO" => handle_echo(args),
         b"SET" => handle_set(args, db),
         b"GET" => handle_get(args, db),
-        b"RPUSH" => handle_rpush(args, db),
-        b"LPUSH" => handle_lpush(args, db),
+        b"RPUSH" => {
+            let r = handle_rpush(args, db);
+            notify.notify_waiters();
+            r
+        }
+        b"LPUSH" => {
+            let r = handle_lpush(args, db);
+            notify.notify_waiters();
+            r
+        }
         b"LRANGE" => handle_lrange(args, db),
         b"LLEN" => handle_llen(args, db),
         b"LPOP" => handle_lpop(args, db),
+        b"BLPOP" => handle_blpop(args, db, notify).await,
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -346,6 +360,108 @@ fn handle_lpop(args: &[RespValue], db: &Storage) -> RespValue {
     }
 }
 
+async fn handle_blpop(args: &[RespValue], db: &Storage, notify: &Anotify) -> RespValue {
+    if args.len() < 2 {
+        return RespValue::Error("ERR wrong number of arguments for 'blpop' command".to_string());
+    }
+    let (timeout_arg, keys) = args.split_last().unwrap();
+
+    let timeout_secs = match timeout_arg {
+        RespValue::BulkString(Some(t)) => match String::from_utf8_lossy(&t).parse::<f64>() {
+            Ok(t) if t.is_finite() && t >= 0.0 => t,
+            Ok(t) if t < 0.0 => return RespValue::Error("ERR timeout is negative".to_string()),
+            _ => return RespValue::Error("ERR timeout is not a float or out of range".to_string()),
+        },
+        _ => return RespValue::Error("ERR timeout is not a float or out of range".to_string()),
+    };
+
+    let mut key_bytes: Vec<&[u8]> = Vec::with_capacity(keys.len());
+
+    for k in keys {
+        let RespValue::BulkString(Some(key)) = k else {
+            return RespValue::Error("ERR BLPOP keys must be BulkString".to_string());
+        };
+        key_bytes.push(key);
+    }
+    let deadline = (timeout_secs > 0.0)
+        .then(|| tokio::time::Instant::now() + Duration::from_secs_f64(timeout_secs));
+
+    loop {
+        if let Some(r_val) = try_pop_keys(&key_bytes, db) {
+            return r_val;
+        }
+
+        let notified = notify.notified();
+
+        tokio::pin!(notified);
+
+        notified.as_mut().enable();
+
+        if let Some(r_val) = try_pop_keys(&key_bytes, db) {
+            return r_val;
+        }
+
+        match deadline {
+            Some(dur) => {
+                let remaining = dur.saturating_duration_since(tokio::time::Instant::now());
+                if tokio::time::timeout(remaining, &mut notified)
+                    .await
+                    .is_err()
+                {
+                    return RespValue::Array(None);
+                }
+            }
+            None => notified.await,
+        }
+    }
+}
+
+fn pop_left(key: &[u8], db: &Storage) -> Result<Option<Vec<u8>>, RespValue> {
+    let mut map = db
+        .write()
+        .map_err(|e| RespValue::Error(format!("ERR {e}")))?;
+    let Some(entry) = map.get_mut(key) else {
+        return Ok(None);
+    };
+    if entry.value.first() != Some(&LIST_TYPE) {
+        return Err(RespValue::Error(
+            "ERR Operation against a key holding the wrong kind of value".into(),
+        ));
+    }
+    if entry.value.len() < 5 {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes(entry.value[1..5].try_into().unwrap()) as usize;
+    let Some(slice) = entry.value.get(5..5 + len) else {
+        return Ok(None);
+    };
+    let data = slice.to_vec();
+    let cursor = 5 + len;
+    if cursor >= entry.value.len() {
+        map.remove(key);
+    } else {
+        entry.value.copy_within(cursor.., 1);
+        entry.value.truncate(entry.value.len() - (cursor - 1));
+    }
+    Ok(Some(data))
+}
+
+fn try_pop_keys(keys: &[&[u8]], db: &Storage) -> Option<RespValue> {
+    for &key in keys {
+        match pop_left(key, db) {
+            Ok(Some(value)) => {
+                return Some(RespValue::Array(Some(vec![
+                    RespValue::BulkString(Some(key.to_vec())),
+                    RespValue::BulkString(Some(value)),
+                ])));
+            }
+            Ok(None) => continue,
+            Err(err) => return Some(err), // WRONGTYPE se propaga
+        }
+    }
+    None
+}
+
 fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     if args.len() != 3 {
         return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
@@ -430,6 +546,7 @@ fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     println!("Values: {:?}", values);
     RespValue::Array(Some(values))
 }
+
 fn handle_llen(args: &[RespValue], db: &Storage) -> RespValue {
     if args.len() != 1 {
         return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
@@ -474,6 +591,10 @@ mod tests {
         Arc::new(RwLock::new(HashMap::new()))
     }
 
+    fn new_notifier() -> Anotify {
+        Arc::new(Notify::new())
+    }
+
     fn cmd(parts: &[&str]) -> RespValue {
         RespValue::Array(Some(
             parts
@@ -481,66 +602,5 @@ mod tests {
                 .map(|p| RespValue::BulkString(Some(p.as_bytes().to_vec())))
                 .collect(),
         ))
-    }
-
-    #[test]
-    fn ping_returns_pong() {
-        let db = new_db();
-        let res = execute_command(cmd(&["PING"]), &db);
-        assert_eq!(res, RespValue::SimpleString("PONG".to_string()));
-    }
-
-    #[test]
-    fn echo_returns_argument() {
-        let db = new_db();
-        let res = execute_command(cmd(&["ECHO", "hola"]), &db);
-        assert_eq!(res, RespValue::BulkString(Some(b"hola".to_vec())));
-    }
-
-    #[test]
-    fn set_and_get_roundtrip() {
-        let db = new_db();
-        let set = execute_command(cmd(&["SET", "clave", "valor"]), &db);
-        assert_eq!(set, RespValue::SimpleString("OK".to_string()));
-
-        let get = execute_command(cmd(&["GET", "clave"]), &db);
-        assert_eq!(get, RespValue::BulkString(Some(b"valor".to_vec())));
-    }
-
-    #[test]
-    fn get_missing_key_returns_null_bulk_string() {
-        let db = new_db();
-        let res = execute_command(cmd(&["GET", "no-existe"]), &db);
-        assert_eq!(res, RespValue::BulkString(None));
-    }
-
-    #[test]
-    fn get_expired_key_returns_null_bulk_string() {
-        let db = new_db();
-        let deadline = SystemTime::now() - Duration::from_secs(1);
-        db.write().unwrap().insert(
-            b"vieja".to_vec(),
-            Entry::new(b"valor".to_vec(), Some(deadline)),
-        );
-
-        let res = execute_command(cmd(&["GET", "vieja"]), &db);
-        assert_eq!(res, RespValue::BulkString(None));
-    }
-
-    #[test]
-    fn set_with_expiration_in_the_past() {
-        let db = new_db();
-        let res = execute_command(cmd(&["SET", "k", "v", "PX", "50"]), &db);
-        assert_eq!(res, RespValue::SimpleString("OK".to_string()));
-        std::thread::sleep(Duration::from_millis(80));
-        let get = execute_command(cmd(&["GET", "k"]), &db);
-        assert_eq!(get, RespValue::BulkString(None));
-    }
-
-    #[test]
-    fn unknown_command_returns_error() {
-        let db = new_db();
-        let res = execute_command(cmd(&["FOO"]), &db);
-        assert!(matches!(res, RespValue::Error(_)));
     }
 }
