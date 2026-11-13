@@ -483,7 +483,7 @@ fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     };
 
     let Some(entry) = map.get(key) else {
-        return RespValue::Array(None);
+        return RespValue::Array(Some(vec![]));
     };
 
     let Ok(end_num) = String::from_utf8_lossy(end).parse::<isize>() else {
@@ -518,7 +518,7 @@ fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     };
 
     if start_num > end_num {
-        return RespValue::Array(None);
+        return RespValue::Array(Some(vec![]));
     }
 
     let mut elements: Vec<&[u8]> = Vec::new();
@@ -579,28 +579,4 @@ fn handle_llen(args: &[RespValue], db: &Storage) -> RespValue {
     }
 
     RespValue::Integers(count)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
-
-    fn new_db() -> Storage {
-        Arc::new(RwLock::new(HashMap::new()))
-    }
-
-    fn new_notifier() -> Anotify {
-        Arc::new(Notify::new())
-    }
-
-    fn cmd(parts: &[&str]) -> RespValue {
-        RespValue::Array(Some(
-            parts
-                .iter()
-                .map(|p| RespValue::BulkString(Some(p.as_bytes().to_vec())))
-                .collect(),
-        ))
-    }
 }
