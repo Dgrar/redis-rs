@@ -215,8 +215,6 @@ pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
         Ok(guard) => guard,
         Err(e) => return RespValue::Error(format!("ERR {}", e)),
     };
-    let mut count = 0;
-    let mut cursor = 1;
 
     let Some(entry) = map.get(key) else {
         return RespValue::Array(None);
@@ -226,24 +224,43 @@ pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
         return RespValue::Error("ERR the end value is not an integer".to_string());
     };
 
-    let end_num = if end_num == -1 {
-        usize::MAX
-    } else if end_num < 0 {
-        return RespValue::Error("ERR the end value must be greater than -2)".to_string());
-    } else {
-        end_num as usize
-    };
-
-    let Ok(start_num) = String::from_utf8_lossy(start).parse::<usize>() else {
+    let Ok(start_num) = String::from_utf8_lossy(start).parse::<isize>() else {
         return RespValue::Error("ERR the end value is not an integer".to_string());
     };
+    let mut count = 0;
+    let mut cursor = 1;
+
+    while cursor + 4 <= entry.value.len() {
+        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
+            Ok(val) => val,
+            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        };
+        let elem_len = u32::from_be_bytes(len_bytes) as usize;
+        cursor += 4 + elem_len;
+        count += 1;
+    }
+
+    println!("Count: {count}");
+    println!("End num: {end_num}");
+    let end_num = if end_num <= -1 {
+        count + end_num
+    } else {
+        end_num
+    };
+    let start_num = if start_num <= -1 {
+        count + start_num
+    } else {
+        start_num
+    };
+    println!("New end num: {end_num}");
 
     if start_num > end_num {
         return RespValue::Array(None);
     }
 
     let mut elements: Vec<&[u8]> = Vec::new();
-
+    cursor = 1;
+    count = 0;
     while cursor + 4 <= entry.value.len() && count <= end_num {
         let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
             Ok(len) => len,
@@ -263,7 +280,7 @@ pub fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
         .into_iter()
         .map(|el| RespValue::BulkString(Some(el.to_vec())))
         .collect();
-
+    println!("Values: {:?}", values);
     RespValue::Array(Some(values))
 }
 
