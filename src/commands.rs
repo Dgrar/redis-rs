@@ -43,6 +43,7 @@ async fn dispatch(elements: Vec<RespValue>, db: &Storage, notify: &Anotify) -> R
         b"LLEN" => handle_llen(args, db),
         b"LPOP" => handle_lpop(args, db),
         b"BLPOP" => handle_blpop(args, db, notify).await,
+        b"TYPE" => handle_type(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -579,4 +580,27 @@ fn handle_llen(args: &[RespValue], db: &Storage) -> RespValue {
     }
 
     RespValue::Integers(count)
+}
+fn handle_type(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 1 {
+        return RespValue::Error("ERR wrong number of arguments for 'type' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'lrange' command".to_string());
+    };
+
+    let map = match db.read() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    let Some(entry) = map.get(key) else {
+        return RespValue::SimpleString("none".to_string());
+    };
+
+    if entry.value.first() == Some(&LIST_TYPE) {
+        return RespValue::SimpleString("list".to_string());
+    }
+    RespValue::SimpleString("string".to_string())
 }
