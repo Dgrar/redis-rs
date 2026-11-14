@@ -681,7 +681,7 @@ fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
         Ok(id) => id,
         Err(err) => return err,
     };
-
+    println!("{:?}", id);
     if id.ms == 0 && id.seq == 0 {
         return RespValue::Error(
             "ERR The ID specified in XADD must be greater than 0-0".to_string(),
@@ -722,6 +722,7 @@ fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
             .extend_from_slice(&(value.len() as u32).to_be_bytes());
         entry.value.extend_from_slice(value);
     }
+    println!("Reaches count");
     // Ponemos el número de ids
     let count = u32::from_be_bytes(match entry.value[1..5].try_into() {
         Ok(c) => c,
@@ -733,7 +734,7 @@ fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
     entry.value[1..5].copy_from_slice(&(count + 1).to_be_bytes());
     // Ponemos el valor del último id
     entry.value[5..21].copy_from_slice(&id.to_bytes());
-
+    println!("{}-{}", id.ms, id.seq);
     RespValue::BulkString(Some(format!("{}-{}", id.ms, id.seq).into_bytes()))
 }
 
@@ -747,7 +748,6 @@ fn parse_xadd_id(raw: &[u8], last: Option<StreamId>) -> Result<StreamId, RespVal
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
             .unwrap_or(0);
-        // Si el reloj retrocede (o empata), seguimos siendo estrictamente crecientes
         return Ok(match last {
             Some(previous) if now_ms <= previous.ms => StreamId {
                 ms: previous.ms,
@@ -763,6 +763,7 @@ fn parse_xadd_id(raw: &[u8], last: Option<StreamId>) -> Result<StreamId, RespVal
     let seq: u64 = if seq_part == "*" {
         match last {
             Some(previous) if previous.ms == ms => previous.seq + 1,
+            _ if ms == 0 => 1,
             _ => 0,
         }
     } else {
