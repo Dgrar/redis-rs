@@ -44,6 +44,7 @@ async fn dispatch(elements: Vec<RespValue>, db: &Storage, notify: &Anotify) -> R
         b"LPOP" => handle_lpop(args, db),
         b"BLPOP" => handle_blpop(args, db, notify).await,
         b"TYPE" => handle_type(args, db),
+        b"XADD" => handle_xadd(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -599,8 +600,170 @@ fn handle_type(args: &[RespValue], db: &Storage) -> RespValue {
         return RespValue::SimpleString("none".to_string());
     };
 
-    if entry.value.first() == Some(&LIST_TYPE) {
-        return RespValue::SimpleString("list".to_string());
+    match entry.value.first() {
+        Some(&LIST_TYPE) => RespValue::SimpleString("list".to_string()),
+        Some(&STREAM_TYPE) => RespValue::SimpleString("stream".to_string()),
+        _ => RespValue::SimpleString("string".to_string()),
     }
-    RespValue::SimpleString("string".to_string())
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+struct StreamId {
+    ms: u64,
+    seq: u64,
+}
+
+impl StreamId {
+    fn to_bytes(self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&self.ms.to_be_bytes());
+        buf[8..16].copy_from_slice(&self.seq.to_be_bytes());
+        buf
+    }
+
+    fn from_bytes(buf: &[u8]) -> Self {
+        let ms = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+        let seq = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+        Self { ms, seq }
+    }
+}
+
+const STREAM_TYPE: u8 = 0x03;
+
+/// Cabecera fija de un stream: [tipo 1][nº entradas u32 BE][último ID: ms u64 BE + seq u64 BE]
+const STREAM_HEADER_LEN: usize = 21;
+
+fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
+    // key + id + pares campo/valor => longitud par y al menos 4
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
+        return RespValue::Error("ERR wrong number of arguments for 'xadd' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'xadd' command".to_string());
+    };
+
+    let RespValue::BulkString(Some(raw_id)) = &args[1] else {
+        return stream_id_error_message();
+    };
+
+    let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity((args.len() - 2) / 2);
+    for pair in args[2..].as_chunks::<2>().0 {
+        let (RespValue::BulkString(Some(field)), RespValue::BulkString(Some(value))) =
+            (&pair[0], &pair[1])
+        else {
+            return RespValue::Error("ERR fields and values must be BulkString".to_string());
+        };
+        pairs.push((field, value));
+    }
+
+    let mut map = match db.write() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    let last = match map.get(key) {
+        Some(entry) => {
+            if entry.value.first() != Some(&STREAM_TYPE) {
+                return RespValue::Error(
+                    "ERR Operation against a key holding the wrong kind of value".to_string(),
+                );
+            }
+            if entry.value.len() < STREAM_HEADER_LEN {
+                return RespValue::Error("ERR invalid stream encoding".to_string());
+            }
+            let count = u32::from_be_bytes(entry.value[1..5].try_into().unwrap());
+            (count != 0).then(|| StreamId::from_bytes(&entry.value[5..21]))
+        }
+        None => None,
+    };
+
+    let id = match parse_xadd_id(raw_id, last) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+
+    if id.ms == 0 && id.seq == 0 {
+        return RespValue::Error(
+            "ERR The ID specified in 'xadd' must be greater than 0-0".to_string(),
+        );
+    }
+
+    if let Some(previous) = last
+        && id <= previous
+    {
+        return RespValue::Error(
+            "ERR The ID specified in 'xadd' is equal or smaller than the target stream top item"
+                .to_string(),
+        );
+    }
+
+    let entry = map.entry(key.to_vec()).or_insert_with(|| Entry {
+        value: create_stream_header(),
+        expires_at: None,
+    });
+
+    // Entrada: [ID 16][nº pares u32][ (len campo, campo) (len valor, valor) ]...
+    entry.value.extend_from_slice(&id.to_bytes());
+    entry
+        .value
+        .extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+    for (field, value) in &pairs {
+        entry
+            .value
+            .extend_from_slice(&(field.len() as u32).to_be_bytes());
+        entry.value.extend_from_slice(field);
+        entry
+            .value
+            .extend_from_slice(&(value.len() as u32).to_be_bytes());
+        entry.value.extend_from_slice(value);
+    }
+
+    let count = u32::from_be_bytes(entry.value[1..5].try_into().unwrap());
+    entry.value[1..5].copy_from_slice(&(count + 1).to_be_bytes());
+    entry.value[5..21].copy_from_slice(&id.to_bytes());
+
+    RespValue::BulkString(Some(format!("{}-{}", id.ms, id.seq).into_bytes()))
+}
+
+fn stream_id_error_message() -> RespValue {
+    RespValue::Error("ERR Invalid stream ID specified as stream command argument".to_string())
+}
+
+fn parse_xadd_id(raw: &[u8], last: Option<StreamId>) -> Result<StreamId, RespValue> {
+    if raw == b"*" {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        // Si el reloj retrocede (o empata), seguimos siendo estrictamente crecientes
+        return Ok(match last {
+            Some(previous) if now_ms <= previous.ms => StreamId {
+                ms: previous.ms,
+                seq: previous.seq + 1,
+            },
+            _ => StreamId { ms: now_ms, seq: 0 },
+        });
+    }
+
+    let text = String::from_utf8_lossy(raw);
+    let (ms_part, seq_part) = text.split_once('-').ok_or_else(stream_id_error_message)?;
+    let ms: u64 = ms_part.parse().map_err(|_| stream_id_error_message())?;
+    let seq: u64 = if seq_part == "*" {
+        match last {
+            Some(previous) if previous.ms == ms => previous.seq + 1,
+            _ => 0,
+        }
+    } else {
+        seq_part.parse().map_err(|_| stream_id_error_message())?
+    };
+
+    Ok(StreamId { ms, seq })
+}
+
+fn create_stream_header() -> Vec<u8> {
+    let mut vec = vec![STREAM_TYPE];
+    vec.extend_from_slice(&0u32.to_be_bytes());
+    vec.extend_from_slice(&[0u8; 16]);
+    vec
 }
