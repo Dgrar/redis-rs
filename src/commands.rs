@@ -634,7 +634,6 @@ const STREAM_TYPE: u8 = 0x03;
 const STREAM_HEADER_LEN: usize = 21;
 
 fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
-    // key + id + pares campo/valor => longitud par y al menos 4
     if args.len() < 4 || !args.len().is_multiple_of(2) {
         return RespValue::Error("ERR wrong number of arguments for 'xadd' command".to_string());
     }
@@ -685,7 +684,7 @@ fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
 
     if id.ms == 0 && id.seq == 0 {
         return RespValue::Error(
-            "ERR The ID specified in 'xadd' must be greater than 0-0".to_string(),
+            "ERR The ID specified in XADD must be greater than 0-0".to_string(),
         );
     }
 
@@ -693,7 +692,7 @@ fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
         && id <= previous
     {
         return RespValue::Error(
-            "ERR The ID specified in 'xadd' is equal or smaller than the target stream top item"
+            "ERR The ID specified in XADD is equal or smaller than the target stream top item"
                 .to_string(),
         );
     }
@@ -705,22 +704,34 @@ fn handle_xadd(args: &[RespValue], db: &Storage) -> RespValue {
 
     // Entrada: [ID 16][nº pares u32][ (len campo, campo) (len valor, valor) ]...
     entry.value.extend_from_slice(&id.to_bytes());
+    // Ponemos el número de parejas
     entry
         .value
         .extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+    // Por cada pareja, sacamos el campo y el valor
     for (field, value) in &pairs {
+        // A la entrada le añadimos la longitud del campo
         entry
             .value
             .extend_from_slice(&(field.len() as u32).to_be_bytes());
+        // Ahora le añadimos el campo en si
         entry.value.extend_from_slice(field);
+        // Lo mismo con el valor
         entry
             .value
             .extend_from_slice(&(value.len() as u32).to_be_bytes());
         entry.value.extend_from_slice(value);
     }
-
-    let count = u32::from_be_bytes(entry.value[1..5].try_into().unwrap());
+    // Ponemos el número de ids
+    let count = u32::from_be_bytes(match entry.value[1..5].try_into() {
+        Ok(c) => c,
+        Err(_) => {
+            return RespValue::Error("ERR error at transforming from be bytes to u32".to_string());
+        }
+    });
+    // Cambiamos el numero de ids al numero actualizado
     entry.value[1..5].copy_from_slice(&(count + 1).to_be_bytes());
+    // Ponemos el valor del último id
     entry.value[5..21].copy_from_slice(&id.to_bytes());
 
     RespValue::BulkString(Some(format!("{}-{}", id.ms, id.seq).into_bytes()))
