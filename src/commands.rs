@@ -45,6 +45,7 @@ async fn dispatch(elements: Vec<RespValue>, db: &Storage, notify: &Anotify) -> R
         b"BLPOP" => handle_blpop(args, db, notify).await,
         b"TYPE" => handle_type(args, db),
         b"XADD" => handle_xadd(args, db),
+        b"XRANGE" => handle_xrange(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -201,13 +202,14 @@ fn handle_rpush(args: &[RespValue], db: &Storage) -> RespValue {
     let mut cursor = 1;
 
     while cursor + 4 <= entry.value.len() {
-        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
-            Ok(len) => len,
-            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        let elem_len = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
         };
-        let elem_len = u32::from_be_bytes(len_bytes) as usize;
 
-        cursor += 4 + elem_len;
+        cursor += elem_len as usize;
         count += 1
     }
 
@@ -267,13 +269,14 @@ fn handle_lpush(args: &[RespValue], db: &Storage) -> RespValue {
     let mut cursor = 1;
 
     while cursor + 4 <= entry.value.len() {
-        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
-            Ok(len) => len,
-            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        let elem_len = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
         };
-        let elem_len = u32::from_be_bytes(len_bytes) as usize;
 
-        cursor += 4 + elem_len;
+        cursor += elem_len as usize;
         count += 1
     }
 
@@ -330,17 +333,18 @@ fn handle_lpop(args: &[RespValue], db: &Storage) -> RespValue {
     let mut items_popped: Vec<Vec<u8>> = Vec::new();
 
     while popped_count < count_target && cursor + 4 <= entry.value.len() {
-        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
-            Ok(len) => len,
-            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        let elem_len = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
         };
-        let elem_len = u32::from_be_bytes(len_bytes) as usize;
 
-        let Some(data_slice) = entry.value.get(cursor + 4..cursor + 4 + elem_len) else {
+        let Some(data_slice) = entry.value.get(cursor..cursor + elem_len as usize) else {
             break;
         };
         items_popped.push(data_slice.to_vec());
-        cursor += 4 + elem_len;
+        cursor += elem_len as usize;
         popped_count += 1;
     }
 
@@ -499,12 +503,13 @@ fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     let mut cursor = 1;
 
     while cursor + 4 <= entry.value.len() {
-        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
-            Ok(val) => val,
-            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        let elem_len = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
         };
-        let elem_len = u32::from_be_bytes(len_bytes) as usize;
-        cursor += 4 + elem_len;
+        cursor += elem_len as usize;
         count += 1;
     }
 
@@ -527,18 +532,19 @@ fn handle_lrange(args: &[RespValue], db: &Storage) -> RespValue {
     cursor = 1;
     count = 0;
     while cursor + 4 <= entry.value.len() && count <= end_num {
-        let len_bytes: [u8; 4] = match entry.value[cursor..cursor + 4].try_into() {
-            Ok(len) => len,
-            Err(_) => return RespValue::Error("ERR could not get the entry slice".to_string()),
+        let elem_len = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
         };
-        let elem_len = u32::from_be_bytes(len_bytes) as usize;
         if count >= start_num {
-            elements.push(match entry.value.get(cursor + 4..cursor + 4 + elem_len) {
+            elements.push(match entry.value.get(cursor..cursor + elem_len as usize) {
                 Some(b) => b,
                 None => break,
             });
         }
-        cursor += 4 + elem_len;
+        cursor += elem_len as usize;
         count += 1
     }
     let values = elements
@@ -778,4 +784,168 @@ fn create_stream_header() -> Vec<u8> {
     vec.extend_from_slice(&0u32.to_be_bytes());
     vec.extend_from_slice(&[0u8; 16]);
     vec
+}
+
+fn read_u32(slice: &[u8], cursor: &mut usize) -> Result<u32, RespValue> {
+    let bytes: [u8; 4] = slice
+        .get(*cursor..*cursor + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| RespValue::Error("ERR corrupted stream data".to_string()))?;
+    *cursor += 4;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_u128(slice: &[u8], cursor: &mut usize) -> Result<[u8; 16], RespValue> {
+    let bytes: [u8; 16] = slice
+        .get(*cursor..*cursor + 16)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| RespValue::Error("ERR corrupted stream data".to_string()))?;
+    *cursor += 16;
+    Ok(bytes)
+}
+
+fn handle_xrange(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 3 {
+        return RespValue::Error("ERR wrong number of arguments for 'xrange' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[0] else {
+        return RespValue::Error("ERR wrong number of arguments for 'xrange' command".to_string());
+    };
+
+    let (RespValue::BulkString(Some(start_id)), RespValue::BulkString(Some(end_id))) =
+        (&args[1], &args[2])
+    else {
+        return stream_id_error_message();
+    };
+
+    let map = match db.read() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    let Some(entry) = map.get(key) else {
+        return RespValue::Array(Some(vec![]));
+    };
+
+    let (Ok(start), Ok(end)) = (
+        parse_stream_id(start_id, false),
+        parse_stream_id(end_id, true),
+    ) else {
+        return stream_id_error_message();
+    };
+
+    let mut cursor = STREAM_HEADER_LEN;
+
+    let mut streams = Vec::new();
+
+    while cursor + 20 <= entry.value.len() {
+        let current_id_bytes = match read_u128(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
+        };
+
+        let current_id = u128::from_be_bytes(current_id_bytes);
+
+        if current_id > end {
+            break;
+        }
+
+        let max_pairs_num = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
+        };
+
+        let mut pairs = Vec::with_capacity(max_pairs_num as usize);
+
+        for _ in 0..max_pairs_num {
+            let length = match read_u32(&entry.value, &mut cursor) {
+                Ok(num) => num,
+                Err(e) => {
+                    return e;
+                }
+            };
+
+            let key_bytes = match entry.value.get(cursor..cursor + length as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    return RespValue::Error(
+                        "ERR at reaching for the key bytes in 'xrange' command".to_string(),
+                    );
+                }
+            };
+            cursor += length as usize;
+
+            let length = match read_u32(&entry.value, &mut cursor) {
+                Ok(num) => num,
+                Err(e) => {
+                    return e;
+                }
+            };
+
+            let value_bytes = match entry.value.get(cursor..cursor + length as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    return RespValue::Error(
+                        "ERR at reaching for the key bytes in 'xrange' command".to_string(),
+                    );
+                }
+            };
+            cursor += length as usize;
+            pairs.push((key_bytes.to_vec(), value_bytes.to_vec()));
+        }
+        if current_id >= start {
+            streams.push((current_id_bytes, pairs));
+        }
+    }
+
+    let result = streams
+        .into_iter()
+        .map(|(id_bytes, pairs)| {
+            let raw_id = u128::from_be_bytes(id_bytes);
+            let ms = (raw_id >> 64) as u64;
+            let seq = raw_id as u64;
+            let formatted_id = format!("{}-{}", ms, seq).into_bytes();
+
+            let mut flat_pairs = Vec::with_capacity(pairs.len() * 2);
+            for (key, val) in pairs {
+                flat_pairs.push(RespValue::BulkString(Some(key)));
+                flat_pairs.push(RespValue::BulkString(Some(val)));
+            }
+
+            RespValue::Array(Some(vec![
+                RespValue::BulkString(Some(formatted_id)),
+                RespValue::Array(Some(flat_pairs)),
+            ]))
+        })
+        .collect();
+
+    RespValue::Array(Some(result))
+}
+
+fn parse_stream_id(bytes: &[u8], is_end: bool) -> Result<u128, ()> {
+    let s = std::str::from_utf8(bytes).map_err(|_| ())?;
+
+    if s == "-" {
+        return Ok(0);
+    }
+    if s == "+" {
+        return Ok(u128::MAX);
+    }
+
+    let (ms, seq) = if let Some((ms_str, seq_str)) = s.split_once('-') {
+        let ms: u64 = ms_str.parse().map_err(|_| ())?;
+        let seq: u64 = seq_str.parse().map_err(|_| ())?;
+        (ms, seq)
+    } else {
+        let ms: u64 = s.parse().map_err(|_| ())?;
+        let seq = if is_end { u64::MAX } else { 0 };
+        (ms, seq)
+    };
+
+    Ok(((ms as u128) << 64) | (seq as u128))
 }
