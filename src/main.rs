@@ -58,6 +58,7 @@ async fn handle_client(mut socket: TcpStream, db: Storage, notify: Arc<Notify>) 
                     buf.advance(consumed);
 
                     let response = commands::execute_command(command, &db, &notify).await;
+                    println!("{:?}", response);
                     socket.write_all(&response.serialize()).await?;
                 }
                 Ok(None) => break,

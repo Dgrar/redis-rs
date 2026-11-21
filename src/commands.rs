@@ -46,6 +46,7 @@ async fn dispatch(elements: Vec<RespValue>, db: &Storage, notify: &Anotify) -> R
         b"TYPE" => handle_type(args, db),
         b"XADD" => handle_xadd(args, db),
         b"XRANGE" => handle_xrange(args, db),
+        b"XREAD" => handle_xread(args, db),
         other => RespValue::Error(format!(
             "ERR comando desconocido '{}'",
             String::from_utf8_lossy(other)
@@ -948,4 +949,120 @@ fn parse_stream_id(bytes: &[u8], is_end: bool) -> Result<u128, ()> {
     };
 
     Ok(((ms as u128) << 64) | (seq as u128))
+}
+
+fn handle_xread(args: &[RespValue], db: &Storage) -> RespValue {
+    if args.len() != 3 {
+        return RespValue::Error("ERR wrong number of arguments for 'xread' command".to_string());
+    }
+
+    let RespValue::BulkString(Some(key)) = &args[1] else {
+        return RespValue::Error("ERR wrong number of arguments for 'xread' command".to_string());
+    };
+
+    let RespValue::BulkString(Some(start_id)) = &args[2] else {
+        return stream_id_error_message();
+    };
+
+    let map = match db.read() {
+        Ok(guard) => guard,
+        Err(e) => return RespValue::Error(format!("ERR {}", e)),
+    };
+
+    let Some(entry) = map.get(key) else {
+        return RespValue::Array(Some(vec![]));
+    };
+
+    let Ok(start) = parse_stream_id(start_id, false) else {
+        return stream_id_error_message();
+    };
+
+    let mut cursor = STREAM_HEADER_LEN;
+
+    let mut streams = Vec::new();
+
+    while cursor + 20 <= entry.value.len() {
+        let current_id_bytes = match read_u128(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
+        };
+
+        let current_id = u128::from_be_bytes(current_id_bytes);
+
+        let max_pairs_num = match read_u32(&entry.value, &mut cursor) {
+            Ok(num) => num,
+            Err(e) => {
+                return e;
+            }
+        };
+
+        let mut pairs = Vec::with_capacity(max_pairs_num as usize);
+
+        for _ in 0..max_pairs_num {
+            let length = match read_u32(&entry.value, &mut cursor) {
+                Ok(num) => num,
+                Err(e) => {
+                    return e;
+                }
+            };
+
+            let key_bytes = match entry.value.get(cursor..cursor + length as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    return RespValue::Error(
+                        "ERR at reaching for the key bytes in 'xread' command".to_string(),
+                    );
+                }
+            };
+            cursor += length as usize;
+
+            let length = match read_u32(&entry.value, &mut cursor) {
+                Ok(num) => num,
+                Err(e) => {
+                    return e;
+                }
+            };
+
+            let value_bytes = match entry.value.get(cursor..cursor + length as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    return RespValue::Error(
+                        "ERR at reaching for the key bytes in 'xread' command".to_string(),
+                    );
+                }
+            };
+            cursor += length as usize;
+            pairs.push((key_bytes.to_vec(), value_bytes.to_vec()));
+        }
+        if current_id > start {
+            streams.push((current_id_bytes, pairs));
+        }
+    }
+
+    let result = streams
+        .into_iter()
+        .map(|(id_bytes, pairs)| {
+            let raw_id = u128::from_be_bytes(id_bytes);
+            let ms = (raw_id >> 64) as u64;
+            let seq = raw_id as u64;
+            let formatted_id = format!("{}-{}", ms, seq).into_bytes();
+
+            let mut flat_pairs = Vec::with_capacity(pairs.len() * 2);
+            for (key, val) in pairs {
+                flat_pairs.push(RespValue::BulkString(Some(key)));
+                flat_pairs.push(RespValue::BulkString(Some(val)));
+            }
+            RespValue::Array(Some(vec![
+                RespValue::BulkString(Some(key.to_vec())),
+                RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                    RespValue::BulkString(Some(formatted_id)),
+                    RespValue::Array(Some(flat_pairs)),
+                ]))])),
+            ]))
+        })
+        .collect();
+
+    RespValue::Array(Some(result))
 }
